@@ -322,7 +322,7 @@ async fn reuses_existing_meter_mrid_and_responds_to_post_rate() {
 <MirrorUsagePointList xmlns="urn:ieee:std:2030.5:ns" xmlns:csipaus="https://csipaus.org/ns" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" href="/mup" all="0" results="0" pollRate="{MOCK_POLL_RATE}">
   <MirrorUsagePoint href="/mup/2">
     <mRID>EEF6A7789439E7456F9D2CDF00000000</mRID>
-    <roleFlags>00</roleFlags>
+    <roleFlags>03</roleFlags>
     <serviceCategoryKind>0</serviceCategoryKind>
     <status>1</status>
     <deviceLFDI>{lfdi}</deviceLFDI>
@@ -340,6 +340,13 @@ async fn reuses_existing_meter_mrid_and_responds_to_post_rate() {
         <uom>38</uom>
       </ReadingType>
     </MirrorMeterReading>
+  </MirrorUsagePoint>
+  <MirrorUsagePoint href="/mup/3">
+    <mRID>EEF6A7789439E7456F9D2CDF00000001</mRID>
+    <roleFlags>49</roleFlags>
+    <serviceCategoryKind>0</serviceCategoryKind>
+    <status>1</status>
+    <deviceLFDI>{lfdi}</deviceLFDI>
   </MirrorUsagePoint>
 </MirrorUsagePointList>
 "#, lfdi=mock_lfdi())).await;
@@ -609,7 +616,8 @@ async fn setup_mup_mocks(mock: &MockServer) {
     Mock::given(matchers::method("POST"))
         .and(matchers::path("/mup"))
         .respond_with(ResponseTemplate::new(201).append_header("Location", "/mup/2"))
-        .expect(1)
+        // Both a site and a device MUP are registered.
+        .expect(2)
         .named("MUP register")
         .mount(mock)
         .await;

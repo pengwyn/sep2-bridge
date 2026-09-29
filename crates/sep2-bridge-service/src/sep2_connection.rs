@@ -20,7 +20,8 @@ use sep2_common::{
         response::DERControlResponse,
         time::Time,
         types::{
-            MRIDType, PINType, PhaseCode, PowerOfTenMultiplierType, UomType, UsagePointStatus,
+            MRIDType, PINType, PhaseCode, PowerOfTenMultiplierType, RoleFlagsType, UomType,
+            UsagePointStatus,
         },
     },
 };
@@ -211,8 +212,10 @@ pub async fn task(
     // Meter readings
     let mut latest_meter_readings = None;
     let mut last_sent_meter_readings = None;
-    let mut mirror_usage_point = None;
-    let mut reading_mrid_cache = HashMap::new();
+    let mut site_mup = None;
+    let mut site_mrid_cache = HashMap::new();
+    let mut device_mup = None;
+    let mut device_mrid_cache = HashMap::new();
 
     let mut retry_handle: Option<JoinHandle<_>> = None;
     let mut retry_requested: bool = false;
@@ -352,8 +355,10 @@ pub async fn task(
                 server_device = None;
                 server_registration_info = None;
                 der_option = None;
-                mirror_usage_point = None;
-                reading_mrid_cache.clear();
+                site_mup = None;
+                site_mrid_cache.clear();
+                device_mup = None;
+                device_mrid_cache.clear();
                 last_sent_device_settings = None;
                 last_sent_device_status = None;
                 last_sent_device_capabilities = None;
@@ -558,14 +563,31 @@ pub async fn task(
             && last_sent_meter_readings
                 .is_none_or(|time| Instant::now().duration_since(time) > post_rate_mup)
         {
+            // CSIP-AUS requires readings on both a site and a device scoped
+            // MUP.
+            const SITE_ROLE: RoleFlagsType =
+                RoleFlagsType::IsMirror.union(RoleFlagsType::IsPremiseAggregationPoint);
+            const DEVICE_ROLE: RoleFlagsType = RoleFlagsType::IsMirror
+                .union(RoleFlagsType::IsDER)
+                .union(RoleFlagsType::IsSubmeter);
             if send_meter_readings(
                 &args,
                 dcap,
-                &mut mirror_usage_point,
+                SITE_ROLE,
+                &mut site_mup,
                 readings,
-                &mut reading_mrid_cache,
+                &mut site_mrid_cache,
             )
             .await
+                || send_meter_readings(
+                    &args,
+                    dcap,
+                    DEVICE_ROLE,
+                    &mut device_mup,
+                    readings,
+                    &mut device_mrid_cache,
+                )
+                .await
             {
                 // Retry requested
                 continue;
@@ -860,6 +882,7 @@ async fn send_control_responses(
 async fn send_meter_readings(
     args: &Sep2ConnectionArgs,
     dcap: &DeviceCapability,
+    role_flags: RoleFlagsType,
     mirror_usage_point: &mut Option<String>,
     readings: &Vec<MirrorMeterReading>,
     reading_mrid_cache: &mut HashMap<CacheKey, MRIDType>,
@@ -874,6 +897,7 @@ async fn send_meter_readings(
             args.client.clone(),
             dcap,
             args.device_to_register.lfdi,
+            role_flags,
             args.max_list_size,
         )
         .await;
@@ -909,7 +933,8 @@ async fn send_meter_readings(
                 return true;
             };
 
-            *mirror_usage_point = ensure_mup(args, &mupl_link.href, modified_reading).await;
+            *mirror_usage_point =
+                ensure_mup(args, &mupl_link.href, role_flags, modified_reading).await;
 
             if mirror_usage_point.is_none() {
                 // If ensure_mup returned None, then this means we need to retry.
@@ -923,12 +948,13 @@ async fn send_meter_readings(
     false
 }
 
-/// Lookup the MirrorUsagePoint for this device. Returns the full MUP details or
+/// Lookup the MirrorUsagePoint for this device and role. Returns the full MUP details or
 /// None if no MUP is registered
 async fn lookup_mup(
     client: Client,
     mupl_href: &str,
     lfdi: HexBinary160,
+    role_flags: RoleFlagsType,
     max_list_size: u32,
 ) -> Option<MirrorUsagePoint> {
     let mup_list = match client
@@ -946,7 +972,7 @@ async fn lookup_mup(
     mup_list
         .mirror_usage_point
         .iter()
-        .find(|mup| mup.device_lfdi == lfdi)
+        .find(|mup| mup.device_lfdi == lfdi && mup.role_flags == role_flags)
         .cloned()
 }
 
@@ -960,6 +986,7 @@ async fn lookup_mup(
 async fn ensure_mup(
     args: &Sep2ConnectionArgs,
     mupl_href: &str,
+    role_flags: RoleFlagsType,
     reading: MirrorMeterReading,
 ) -> Option<String> {
     // See if we already have a MUP registered.
@@ -967,6 +994,7 @@ async fn ensure_mup(
         args.client.clone(),
         mupl_href,
         args.device_to_register.lfdi,
+        role_flags,
         args.max_list_size,
     )
     .await
@@ -996,6 +1024,7 @@ async fn ensure_mup(
                 device_lfdi: args.device_to_register.lfdi,
                 status: UsagePointStatus::On,
                 mirror_meter_reading: vec![reading],
+                role_flags,
                 ..Default::default()
             },
         )
@@ -1023,6 +1052,7 @@ async fn initialise_reading_mrid_cache(
     client: Client,
     dcap: &DeviceCapability,
     lfdi: HexBinary160,
+    role_flags: RoleFlagsType,
     max_list_size: u32,
 ) -> HashMap<CacheKey, MRIDType> {
     let Some(mupl_link) = dcap.mirror_usage_point_list_link.as_ref() else {
@@ -1031,7 +1061,15 @@ async fn initialise_reading_mrid_cache(
         return HashMap::new();
     };
 
-    let Some(mup) = lookup_mup(client.clone(), &mupl_link.href, lfdi, max_list_size).await else {
+    let Some(mup) = lookup_mup(
+        client.clone(),
+        &mupl_link.href,
+        lfdi,
+        role_flags,
+        max_list_size,
+    )
+    .await
+    else {
         return HashMap::new();
     };
 

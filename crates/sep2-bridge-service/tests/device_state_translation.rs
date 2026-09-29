@@ -23,7 +23,7 @@ use sep2_common::{
         primitives::{Int16, Int48, Uint16, Uint32},
         types::{
             AccumulationBehaviourType, CommodityType, FlowDirectionType, KindType, MRIDType,
-            Percent, PhaseCode, PowerOfTenMultiplierType, UomType,
+            Percent, PhaseCode, PowerOfTenMultiplierType, RoleFlagsType, UomType,
         },
     },
     traits::SEType,
@@ -593,38 +593,57 @@ async fn setup_der_mocks(mock: &MockServer) {
 
 /// Mounts the MUP endpoints the device metrics are POSTed to.
 async fn setup_readings_mocks(mock: &MockServer) {
+    // The bridge sends readings to both a site and a device MUP. The site MUP
+    // holds the pre-existing reading that the test looks for.
+    const HREF_DEVICE_MUP: &str = "/mup/2";
+
     mock_resource(
         mock,
         HREF_MUPL,
         &MirrorUsagePointList {
             href: Some(HREF_MUPL.into()),
             poll_rate: Some(Uint32(MOCK_POLL_RATE)),
-            mirror_usage_point: vec![MirrorUsagePoint {
-                href: Some(HREF_MUP.into()),
-                mrid: MRIDType(42),
-                device_lfdi: mock_lfdi(),
-                mirror_meter_reading: vec![MirrorMeterReading {
-                    mrid: MRID_POWER_READING,
-                    reading_type: Some(ReadingType {
-                        flow_direction: Some(FlowDirectionType::Reverse),
-                        uom: Some(UomType::W),
-                        phase: None,
-                        kind: Some(KindType::Power),
-                        accumulation_behaviour: Some(AccumulationBehaviourType::Instantaneous),
-                        commodity: Some(CommodityType::ElectricitySecondaryMetered),
-                        power_of_ten_multiplier: Some(EXPECTED_METER_W_MULTIPLIER),
+            mirror_usage_point: vec![
+                MirrorUsagePoint {
+                    href: Some(HREF_MUP.into()),
+                    mrid: MRIDType(42),
+                    device_lfdi: mock_lfdi(),
+                    mirror_meter_reading: vec![MirrorMeterReading {
+                        mrid: MRID_POWER_READING,
+                        reading_type: Some(ReadingType {
+                            flow_direction: Some(FlowDirectionType::Reverse),
+                            uom: Some(UomType::W),
+                            phase: None,
+                            kind: Some(KindType::Power),
+                            accumulation_behaviour: Some(AccumulationBehaviourType::Instantaneous),
+                            commodity: Some(CommodityType::ElectricitySecondaryMetered),
+                            power_of_ten_multiplier: Some(EXPECTED_METER_W_MULTIPLIER),
+                            ..Default::default()
+                        }),
+
                         ..Default::default()
-                    }),
+                    }],
+
+                    post_rate: Some(Uint32(60)),
+                    role_flags: RoleFlagsType::IsMirror
+                        .union(RoleFlagsType::IsPremiseAggregationPoint),
 
                     ..Default::default()
-                }],
+                },
+                MirrorUsagePoint {
+                    href: Some(HREF_DEVICE_MUP.into()),
+                    mrid: MRIDType(43),
+                    device_lfdi: mock_lfdi(),
+                    post_rate: Some(Uint32(60)),
+                    role_flags: RoleFlagsType::IsMirror
+                        .union(RoleFlagsType::IsDER)
+                        .union(RoleFlagsType::IsSubmeter),
 
-                post_rate: Some(Uint32(60)),
-
-                ..Default::default()
-            }],
-            all: Uint32(1),
-            results: Uint32(1),
+                    ..Default::default()
+                },
+            ],
+            all: Uint32(2),
+            results: Uint32(2),
         },
     )
     .await;
@@ -633,6 +652,13 @@ async fn setup_readings_mocks(mock: &MockServer) {
         .and(matchers::path(HREF_MUP))
         .respond_with(ResponseTemplate::new(204))
         .named(HREF_MUP)
+        .mount(mock)
+        .await;
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path(HREF_DEVICE_MUP))
+        .respond_with(ResponseTemplate::new(204))
+        .named(HREF_DEVICE_MUP)
         .mount(mock)
         .await;
 }
