@@ -407,6 +407,18 @@ async fn read_model_safe<M: Model>(device: &AsyncDevice<TokioModbusContext>) -> 
     Ok(Some(device.read_model().await.map_err(comm_err)?))
 }
 
+/// Reads only the fixed (non-repeating) part of a model in a single request.
+/// Points are then extracted with `Point::from_data`. This gives the scale
+/// factors and repeating group counts without needing to know the sizes of the
+/// repeating groups, which `Model::parse` would require.
+async fn read_model_header<M: Model>(device: &AsyncDevice<TokioModbusContext>) -> Result<Vec<u16>> {
+    device
+        .client
+        .read_registers(device.slave_id, M::addr(&device.models).addr, M::LEN)
+        .await
+        .map_err(comm_err)
+}
+
 /////
 // Specific queries to different sunspec models.
 //
@@ -665,49 +677,82 @@ async fn send_new_parameters(
     Ok(())
 }
 
-/// Conditionally writes only when the value is Some(_).
-async fn write_if_some<T: FixedSize, M: Model>(
-    device: &AsyncDevice<TokioModbusContext>,
-    p: Point<M, Option<T>>,
-    value: Option<T>,
-) -> Result<()> {
-    match value {
-        None => Ok(()),
-        Some(value) => device.write_point(p, Some(value)).await.map_err(comm_err),
+/// Collects register writes so they can be sent in as few requests as
+/// possible.
+///
+/// Only writes to exactly adjacent registers are merged into a single request.
+/// Gaps are never filled in, so a register is only ever written if it was
+/// explicitly added to the batch. The writes in a batch may be sent in a
+/// different order to how they were added, so anything that must happen
+/// afterwards (e.g. AdptCrvReq) should be written after `send`.
+#[derive(Default)]
+struct WriteBatch {
+    writes: Vec<(u16, Box<[u16]>)>,
+}
+
+impl WriteBatch {
+    /// Adds a point to the batch. `offset` is the absolute register address of
+    /// the start of the model or group that the point belongs to.
+    fn add<G: Group, T: Value>(&mut self, offset: u16, p: Point<G, T>, value: T) {
+        self.writes.push((offset + p.offset, value.encode()));
     }
-}
 
-/// As for write_if_some, but with a ScaledValue and a target scale factor.
-async fn write_rescaled_if_some<T: FixedSize + ScaledValueInner, M: Model>(
-    device: &AsyncDevice<TokioModbusContext>,
-    p: Point<M, Option<T>>,
-    value: Option<ScaledValue<T>>,
-    scale_factor: i16,
-) -> Result<()> {
-    write_if_some(
-        device,
-        p,
-        value.map(|inner| inner.rescale(scale_factor).value),
-    )
-    .await
-}
+    /// Adds a point to the batch only when the value is Some(_).
+    fn add_if_some<G: Group, T: FixedSize>(
+        &mut self,
+        offset: u16,
+        p: Point<G, Option<T>>,
+        value: Option<T>,
+    ) {
+        if let Some(value) = value {
+            self.add(offset, p, Some(value));
+        }
+    }
 
-/// A convenience tool for writing points that are part of repeating groups.
-/// Requires the absolute register address for the start of the group and a
-/// point within the group.
-async fn write_offset_point<G: Group, T: Value>(
-    device: &AsyncDevice<TokioModbusContext>,
-    offset: u16,
-    p: Point<G, T>,
-    value: T,
-) -> Result<()> {
-    let addr = offset + p.offset;
-    let words = value.encode();
-    device
-        .client
-        .write_registers(device.slave_id, addr, &words)
-        .await
-        .map_err(comm_err)
+    /// As for add_if_some, but with a ScaledValue and a target scale factor.
+    fn add_rescaled_if_some<G: Group, T: FixedSize + ScaledValueInner>(
+        &mut self,
+        offset: u16,
+        p: Point<G, Option<T>>,
+        value: Option<ScaledValue<T>>,
+        scale_factor: i16,
+    ) {
+        self.add_if_some(
+            offset,
+            p,
+            value.map(|inner| inner.rescale(scale_factor).value),
+        );
+    }
+
+    async fn send(mut self, device: &AsyncDevice<TokioModbusContext>) -> Result<()> {
+        self.writes.sort_by_key(|(addr, _)| *addr);
+
+        // Merge adjacent writes into runs, without splitting any single point
+        // across two requests.
+        let max_len = usize::from(device.config.max_write_length);
+        let mut runs: Vec<(u16, Vec<u16>)> = Vec::new();
+        for (addr, words) in self.writes {
+            match runs.last_mut() {
+                Some((start, data))
+                    if usize::from(*start) + data.len() == usize::from(addr)
+                        && data.len() + words.len() <= max_len =>
+                {
+                    data.extend_from_slice(&words);
+                }
+                _ => runs.push((addr, words.into_vec())),
+            }
+        }
+
+        for (addr, data) in runs {
+            device
+                .client
+                .write_registers(device.slave_id, addr, &data)
+                .await
+                .map_err(comm_err)?;
+        }
+
+        Ok(())
+    }
 }
 
 /////
@@ -720,31 +765,35 @@ async fn send_model703_parameters(
         return Ok(());
     }
 
-    // AS5438 - Table E.10, Section E.4.8
-    write_if_some(device, Model703::ES, parameters.es).await?;
-    if parameters.esv_hi.is_some() || parameters.esv_lo.is_some() {
-        let v_sf = device
-            .read_point(Model703::V_SF)
-            .await
-            .map_err(comm_err)?
-            .unwrap_or_default();
-        write_rescaled_if_some(device, Model703::ESV_HI, parameters.esv_hi, v_sf).await?;
-        write_rescaled_if_some(device, Model703::ESV_LO, parameters.esv_lo, v_sf).await?;
-    }
-    if parameters.es_hz_hi.is_some() || parameters.es_hz_lo.is_some() {
-        let hz_sf = device
-            .read_point(Model703::HZ_SF)
-            .await
-            .map_err(comm_err)?
-            .unwrap_or_default();
-        write_rescaled_if_some(device, Model703::ES_HZ_HI, parameters.es_hz_hi, hz_sf).await?;
-        write_rescaled_if_some(device, Model703::ES_HZ_LO, parameters.es_hz_lo, hz_sf).await?;
-    }
-    write_if_some(device, Model703::ES_DLY_TMS, parameters.es_dly_tms).await?;
-    write_if_some(device, Model703::ES_RND_TMS, parameters.es_rnd_tms).await?;
-    write_if_some(device, Model703::ES_RMP_TMS, parameters.es_rmp_tms).await?;
+    let base = Model703::addr(&device.models).addr;
+    let mut batch = WriteBatch::default();
 
-    Ok(())
+    // AS5438 - Table E.10, Section E.4.8
+    batch.add_if_some(base, Model703::ES, parameters.es);
+    if parameters.esv_hi.is_some()
+        || parameters.esv_lo.is_some()
+        || parameters.es_hz_hi.is_some()
+        || parameters.es_hz_lo.is_some()
+    {
+        let header = read_model_header::<Model703>(device).await?;
+        let v_sf = Model703::V_SF
+            .from_data(&header)
+            .map_err(comm_err)?
+            .unwrap_or_default();
+        let hz_sf = Model703::HZ_SF
+            .from_data(&header)
+            .map_err(comm_err)?
+            .unwrap_or_default();
+        batch.add_rescaled_if_some(base, Model703::ESV_HI, parameters.esv_hi, v_sf);
+        batch.add_rescaled_if_some(base, Model703::ESV_LO, parameters.esv_lo, v_sf);
+        batch.add_rescaled_if_some(base, Model703::ES_HZ_HI, parameters.es_hz_hi, hz_sf);
+        batch.add_rescaled_if_some(base, Model703::ES_HZ_LO, parameters.es_hz_lo, hz_sf);
+    }
+    batch.add_if_some(base, Model703::ES_DLY_TMS, parameters.es_dly_tms);
+    batch.add_if_some(base, Model703::ES_RND_TMS, parameters.es_rnd_tms);
+    batch.add_if_some(base, Model703::ES_RMP_TMS, parameters.es_rmp_tms);
+
+    batch.send(device).await
 }
 
 async fn send_model704_parameters(
@@ -755,128 +804,106 @@ async fn send_model704_parameters(
         return Ok(());
     }
 
+    let base = Model704::addr(&device.models).addr;
+    let mut batch = WriteBatch::default();
+
+    // All of the scale factors are in the fixed part of the model, so read
+    // them in one go.
+    let header = read_model_header::<Model704>(device).await?;
+    let pf_sf = Model704::PF_SF
+        .from_data(&header)
+        .map_err(comm_err)?
+        .unwrap_or_default();
+    let var_set_pct_sf = Model704::VAR_SET_PCT_SF
+        .from_data(&header)
+        .map_err(comm_err)?
+        .unwrap_or_default();
+    let w_max_lim_pct_sf = Model704::W_MAX_LIM_PCT_SF
+        .from_data(&header)
+        .map_err(comm_err)?
+        .unwrap_or_default();
+    let w_set_pct_sf = Model704::W_SET_PCT_SF
+        .from_data(&header)
+        .map_err(comm_err)?
+        .unwrap_or_default();
+    let w_set_sf = Model704::W_SET_SF
+        .from_data(&header)
+        .map_err(comm_err)?
+        .unwrap_or_default();
+
     // AS5438 - Table E.3, Section E.4.1
-    write_if_some(device, Model704::PFW_INJ_ENA, parameters.pfw_inj_ena).await?;
-    write_if_some(device, Model704::PFW_ABS_ENA, parameters.pfw_abs_ena).await?;
+    batch.add_if_some(base, Model704::PFW_INJ_ENA, parameters.pfw_inj_ena);
+    batch.add_if_some(base, Model704::PFW_ABS_ENA, parameters.pfw_abs_ena);
 
     // These points are in non-repeating groups near the end of the model. It
     // makes them annoying to write to as we must calculate the offsets
     // manually.
-    let pfw_inj_offset = Model704::addr(&device.models).addr + Model704::LEN;
+    let pfw_inj_offset = base + Model704::LEN;
     let pfw_abs_offset = pfw_inj_offset + model704::PfwInj::LEN + model704::PfwInjRvrt::LEN;
-    if let Some(pfw_inj_ext) = parameters.pfw_inj_ext {
-        write_offset_point(
-            device,
-            pfw_inj_offset,
-            model704::PfwInj::EXT,
-            Some(pfw_inj_ext),
-        )
-        .await?;
-    }
-    if let Some(pfw_abs_ext) = parameters.pfw_abs_ext {
-        write_offset_point(
-            device,
-            pfw_abs_offset,
-            model704::PfwAbs::EXT,
-            Some(pfw_abs_ext),
-        )
-        .await?;
-    }
-    // Both pfw_inj_pf and pfw_abs_pf share pf_sf so group these and read that
-    // SF only once.
-    if parameters.pfw_inj_pf.is_some() || parameters.pfw_abs_pf.is_some() {
-        let pf_sf = device
-            .read_point(Model704::PF_SF)
-            .await
-            .map_err(comm_err)?
-            .unwrap_or_default();
-        if let Some(pfw_inj_pf) = parameters.pfw_inj_pf {
-            write_offset_point(
-                device,
-                pfw_inj_offset,
-                model704::PfwInj::PF,
-                Some(pfw_inj_pf.rescale(pf_sf).value),
-            )
-            .await?;
-        }
-        if let Some(pfw_abs_pf) = parameters.pfw_abs_pf {
-            write_offset_point(
-                device,
-                pfw_abs_offset,
-                model704::PfwAbs::PF,
-                Some(pfw_abs_pf.rescale(pf_sf).value),
-            )
-            .await?;
-        }
-    }
+    batch.add_if_some(
+        pfw_inj_offset,
+        model704::PfwInj::EXT,
+        parameters.pfw_inj_ext,
+    );
+    batch.add_if_some(
+        pfw_abs_offset,
+        model704::PfwAbs::EXT,
+        parameters.pfw_abs_ext,
+    );
+    batch.add_rescaled_if_some(
+        pfw_inj_offset,
+        model704::PfwInj::PF,
+        parameters.pfw_inj_pf,
+        pf_sf,
+    );
+    batch.add_rescaled_if_some(
+        pfw_abs_offset,
+        model704::PfwAbs::PF,
+        parameters.pfw_abs_pf,
+        pf_sf,
+    );
 
     // AS5438 - Table E.5, Section E.4.3
-    write_if_some(device, Model704::VAR_SET_ENA, parameters.var_set_ena).await?;
-    if parameters.var_set_pct.is_some() {
-        let pct_sf = device
-            .read_point(Model704::VAR_SET_PCT_SF)
-            .await
-            .map_err(comm_err)?
-            .unwrap_or_default();
-        write_rescaled_if_some(
-            device,
-            Model704::VAR_SET_PCT,
-            parameters.var_set_pct,
-            pct_sf,
-        )
-        .await?;
-    }
-    write_if_some(device, Model704::VAR_SET_MOD, parameters.var_set_mod).await?;
+    batch.add_if_some(base, Model704::VAR_SET_ENA, parameters.var_set_ena);
+    batch.add_rescaled_if_some(
+        base,
+        Model704::VAR_SET_PCT,
+        parameters.var_set_pct,
+        var_set_pct_sf,
+    );
+    batch.add_if_some(base, Model704::VAR_SET_MOD, parameters.var_set_mod);
 
     // AS5438 - Table E.11, Section E.4.9
-    write_if_some(
-        device,
+    batch.add_if_some(
+        base,
         Model704::W_MAX_LIM_PCT_ENA,
         parameters.w_max_lim_pct_ena,
-    )
-    .await?;
-    if parameters.w_max_lim_pct.is_some() {
-        let pct_sf = device
-            .read_point(Model704::W_MAX_LIM_PCT_SF)
-            .await
-            .map_err(comm_err)?
-            .unwrap_or_default();
-        write_rescaled_if_some(
-            device,
-            Model704::W_MAX_LIM_PCT,
-            parameters.w_max_lim_pct,
-            pct_sf,
-        )
-        .await?;
-    }
+    );
+    batch.add_rescaled_if_some(
+        base,
+        Model704::W_MAX_LIM_PCT,
+        parameters.w_max_lim_pct,
+        w_max_lim_pct_sf,
+    );
 
     // AS5438 - Table E.12, Section E.4.10
-    write_if_some(device, Model704::W_SET_ENA, parameters.w_set_ena).await?;
-    if parameters.w_set_pct.is_some() {
-        let pct_sf = device
-            .read_point(Model704::W_SET_PCT_SF)
-            .await
-            .map_err(comm_err)?
-            .unwrap_or_default();
-        write_rescaled_if_some(device, Model704::W_SET_PCT, parameters.w_set_pct, pct_sf).await?;
-    }
+    batch.add_if_some(base, Model704::W_SET_ENA, parameters.w_set_ena);
+    batch.add_rescaled_if_some(
+        base,
+        Model704::W_SET_PCT,
+        parameters.w_set_pct,
+        w_set_pct_sf,
+    );
     // Extension: also write WSet if available and write WSetMod to indicate
     // which is chosen.
-    if parameters.w_set.is_some() {
-        let w_set_sf = device
-            .read_point(Model704::W_SET_SF)
-            .await
-            .map_err(comm_err)?
-            .unwrap_or_default();
-        write_rescaled_if_some(device, Model704::W_SET, parameters.w_set, w_set_sf).await?;
-    }
-    write_if_some(device, Model704::W_SET_MOD, parameters.w_set_mod).await?;
+    batch.add_rescaled_if_some(base, Model704::W_SET, parameters.w_set, w_set_sf);
+    batch.add_if_some(base, Model704::W_SET_MOD, parameters.w_set_mod);
 
     // Extension: the default ramp rate.
-    write_if_some(device, Model704::W_RMP, parameters.w_rmp).await?;
-    write_if_some(device, Model704::W_RMP_REF, parameters.w_rmp_ref).await?;
+    batch.add_if_some(base, Model704::W_RMP, parameters.w_rmp);
+    batch.add_if_some(base, Model704::W_RMP_REF, parameters.w_rmp_ref);
 
-    Ok(())
+    batch.send(device).await
 }
 
 async fn send_model705_parameters(
@@ -889,57 +916,34 @@ async fn send_model705_parameters(
     }
 
     let wrote_curve = if let Some(der_volt_var) = parameters.der_volt_var.as_ref() {
-        if let Some(curve_offset) = Model705::write_curve(device, der_volt_var).await? {
-            let tms_sf = device
-                .read_point(Model705::RSP_TMS_SF)
-                .await
-                .map_err(comm_err)?;
-            let v_sf = device.read_point(Model705::V_SF).await.map_err(comm_err)?;
-            if let Some(tms) = parameters.der_volt_var_tms {
-                write_offset_point(
-                    device,
-                    curve_offset,
-                    model705::Crv::RSP_TMS,
-                    Some(tms.rescale(tms_sf).value),
-                )
-                .await
-                .map_err(comm_err)?;
-            }
+        let header = read_model_header::<Model705>(device).await?;
+        let mut batch = WriteBatch::default();
+        if let Some(curve_offset) =
+            Model705::write_curve(device, &header, &mut batch, der_volt_var)?
+        {
+            let tms_sf = Model705::RSP_TMS_SF.from_data(&header).map_err(comm_err)?;
+            let v_sf = Model705::V_SF.from_data(&header).map_err(comm_err)?;
+            batch.add_rescaled_if_some(
+                curve_offset,
+                model705::Crv::RSP_TMS,
+                parameters.der_volt_var_tms,
+                tms_sf,
+            );
             if let Some(dept_ref) = parameters.der_volt_var_dept_ref {
-                write_offset_point(device, curve_offset, model705::Crv::DEPT_REF, dept_ref)
-                    .await
-                    .map_err(comm_err)?;
+                batch.add(curve_offset, model705::Crv::DEPT_REF, dept_ref);
             }
-            if let Some(vref) = parameters.vref {
-                write_offset_point(
-                    device,
-                    curve_offset,
-                    model705::Crv::V_REF,
-                    Some(vref.rescale(v_sf).value),
-                )
-                .await
-                .map_err(comm_err)?;
-            }
-            if let Some(auto_ena) = parameters.vref_auto_ena {
-                write_offset_point(
-                    device,
-                    curve_offset,
-                    model705::Crv::V_REF_AUTO_ENA,
-                    Some(auto_ena),
-                )
-                .await
-                .map_err(comm_err)?;
-            }
-            if let Some(auto_tms) = parameters.vref_auto_tms {
-                write_offset_point(
-                    device,
-                    curve_offset,
-                    model705::Crv::V_REF_AUTO_TMS,
-                    Some(auto_tms),
-                )
-                .await
-                .map_err(comm_err)?;
-            }
+            batch.add_rescaled_if_some(curve_offset, model705::Crv::V_REF, parameters.vref, v_sf);
+            batch.add_if_some(
+                curve_offset,
+                model705::Crv::V_REF_AUTO_ENA,
+                parameters.vref_auto_ena,
+            );
+            batch.add_if_some(
+                curve_offset,
+                model705::Crv::V_REF_AUTO_TMS,
+                parameters.vref_auto_tms,
+            );
+            batch.send(device).await?;
 
             device
                 .write_point(Model705::ADPT_CRV_REQ, Model705::TARGET_CURVE)
@@ -978,26 +982,22 @@ async fn send_model706_parameters(
     }
 
     let wrote_curve = if let Some(der_volt_watt) = parameters.der_volt_watt.as_ref() {
-        if let Some(curve_offset) = Model706::write_curve(device, der_volt_watt).await? {
-            if let Some(tms) = parameters.der_volt_watt_tms {
-                let tms_sf = device
-                    .read_point(Model706::RSP_TMS_SF)
-                    .await
-                    .map_err(comm_err)?;
-                write_offset_point(
-                    device,
-                    curve_offset,
-                    model706::Crv::RSP_TMS,
-                    Some(tms.rescale(tms_sf).value),
-                )
-                .await
-                .map_err(comm_err)?;
-            }
+        let header = read_model_header::<Model706>(device).await?;
+        let mut batch = WriteBatch::default();
+        if let Some(curve_offset) =
+            Model706::write_curve(device, &header, &mut batch, der_volt_watt)?
+        {
+            let tms_sf = Model706::RSP_TMS_SF.from_data(&header).map_err(comm_err)?;
+            batch.add_rescaled_if_some(
+                curve_offset,
+                model706::Crv::RSP_TMS,
+                parameters.der_volt_watt_tms,
+                tms_sf,
+            );
             if let Some(dept_ref) = parameters.der_volt_watt_dept_ref {
-                write_offset_point(device, curve_offset, model706::Crv::DEPT_REF, dept_ref)
-                    .await
-                    .map_err(comm_err)?;
+                batch.add(curve_offset, model706::Crv::DEPT_REF, dept_ref);
             }
+            batch.send(device).await?;
 
             device
                 .write_point(Model706::ADPT_CRV_REQ, Model706::TARGET_CURVE)
@@ -1165,57 +1165,46 @@ async fn send_model711_parameters(
         // As per the modbus spec, the first control is readonly and represents
         // the current state. Make sure the device allows at least one other
         // control before continuing.
-        let n_ctl = device.read_point(Model711::N_CTL).await.map_err(comm_err)?;
+        let header = read_model_header::<Model711>(device).await?;
+        let n_ctl = Model711::N_CTL.from_data(&header).map_err(comm_err)?;
         if n_ctl >= 2 {
             // We write into the second Ctl group.
             let offset = Model711::addr(&device.models).addr + Model711::LEN + model711::Ctl::LEN;
 
-            let db_sf = device.read_point(Model711::DB_SF).await.map_err(comm_err)?;
-            let k_sf = device.read_point(Model711::K_SF).await.map_err(comm_err)?;
-            let rsp_tms_sf = device
-                .read_point(Model711::RSP_TMS_SF)
-                .await
-                .map_err(comm_err)?;
-            // And assign manually
+            let db_sf = Model711::DB_SF.from_data(&header).map_err(comm_err)?;
+            let k_sf = Model711::K_SF.from_data(&header).map_err(comm_err)?;
+            let rsp_tms_sf = Model711::RSP_TMS_SF.from_data(&header).map_err(comm_err)?;
 
-            // FIXME: It would be nice to write all of these registers in one
-            // call. However, we can't write the read_only register itself
-            // so it's not as trivial as encoding the entire struct.
-            write_offset_point(
-                device,
+            // These points are contiguous so the batch sends them in a single
+            // request, without touching the read-only register at the end of
+            // the group.
+            let mut batch = WriteBatch::default();
+            batch.add(
                 offset,
                 model711::Ctl::DB_OF,
                 droop_ctl.db_of.rescale(db_sf).value,
-            )
-            .await?;
-            write_offset_point(
-                device,
+            );
+            batch.add(
                 offset,
                 model711::Ctl::DB_UF,
                 droop_ctl.db_uf.rescale(db_sf).value,
-            )
-            .await?;
-            write_offset_point(
-                device,
+            );
+            batch.add(
                 offset,
                 model711::Ctl::K_OF,
                 droop_ctl.k_of.rescale(k_sf).value,
-            )
-            .await?;
-            write_offset_point(
-                device,
+            );
+            batch.add(
                 offset,
                 model711::Ctl::K_UF,
                 droop_ctl.k_uf.rescale(k_sf).value,
-            )
-            .await?;
-            write_offset_point(
-                device,
+            );
+            batch.add(
                 offset,
                 model711::Ctl::RSP_TMS,
                 droop_ctl.rsp_tms.rescale(rsp_tms_sf).value,
-            )
-            .await?;
+            );
+            batch.send(device).await?;
 
             device
                 .write_point(Model711::ADPT_CTL_REQ, 2)
@@ -1306,18 +1295,20 @@ where
         curve_set_offset + additional_offset
     }
 
-    /// Write a single curve to its offset location, returning true if the curve was written or not.
+    /// Add a single curve at its offset location to the batch, returning true
+    /// if the curve was added or not.
     ///
     /// This function should only be called internally by write_curves. It
     /// assumes that n_curves has already been checked for valid length.
-    async fn write_curve(
+    fn write_curve(
         device: &AsyncDevice<TokioModbusContext>,
+        batch: &mut WriteBatch,
         curve: TripCurve,
         curve_data: &Curve<TX, TY>,
         n_pt: u16,
         x_sf: i16,
         y_sf: i16,
-    ) -> Result<bool> {
+    ) -> bool {
         if curve_data.len() > n_pt {
             log::warn!(
                 "Curve data is longer ({}) than the length supported by the device ({}) in model {}.",
@@ -1325,35 +1316,22 @@ where
                 n_pt,
                 Self::ID
             );
-            return Ok(false);
+            return false;
         }
 
         let curve_addr = Self::addr(&device.models).addr
             + Self::curve_offset(curve, Self::TARGET_CURVE_SET, n_pt);
 
-        // Write the number of active points first.
-        write_offset_point(device, curve_addr, Self::CRV_ACT_PT, Some(curve_data.len())).await?;
+        batch.add(curve_addr, Self::CRV_ACT_PT, Some(curve_data.len()));
 
         for (i, point) in curve_data.iter_scaled().enumerate() {
             let point_addr =
                 curve_addr + Self::curve_static_len(curve) + Self::GPt::LEN * (i as u16);
-            write_offset_point(
-                device,
-                point_addr,
-                Self::X_PT,
-                Some(point.0.rescale(x_sf).value),
-            )
-            .await?;
-            write_offset_point(
-                device,
-                point_addr,
-                Self::Y_PT,
-                Some(point.1.rescale(y_sf).value),
-            )
-            .await?;
+            batch.add(point_addr, Self::X_PT, Some(point.0.rescale(x_sf).value));
+            batch.add(point_addr, Self::Y_PT, Some(point.1.rescale(y_sf).value));
         }
 
-        Ok(true)
+        true
     }
 
     /// Writes up to 3 curves if they are present in the arguments, filling in
@@ -1370,8 +1348,9 @@ where
             if must_trip_data.is_none() && may_trip_data.is_none() && mom_cess_data.is_none() {
                 false
             } else {
-                let n_curves = device.read_point(Self::N_CRV_SET).await.map_err(comm_err)?;
-                let n_pt = device.read_point(Self::N_PT).await.map_err(comm_err)?;
+                let header = read_model_header::<Self>(device).await?;
+                let n_curves = Self::N_CRV_SET.from_data(&header).map_err(comm_err)?;
+                let n_pt = Self::N_PT.from_data(&header).map_err(comm_err)?;
 
                 if n_curves < Self::TARGET_CURVE_SET {
                     log::warn!(
@@ -1381,27 +1360,50 @@ where
                     );
                     false
                 } else {
-                    let x_sf = device.read_point(Self::X_SF).await.map_err(comm_err)?;
-                    let y_sf = device.read_point(Self::Y_SF).await.map_err(comm_err)?;
+                    let x_sf = Self::X_SF.from_data(&header).map_err(comm_err)?;
+                    let y_sf = Self::Y_SF.from_data(&header).map_err(comm_err)?;
+                    let mut batch = WriteBatch::default();
 
                     let wrote_must_trip = if let Some(data) = must_trip_data {
-                        Self::write_curve(device, TripCurve::MustTrip, data, n_pt, x_sf, y_sf)
-                            .await?
+                        Self::write_curve(
+                            device,
+                            &mut batch,
+                            TripCurve::MustTrip,
+                            data,
+                            n_pt,
+                            x_sf,
+                            y_sf,
+                        )
                     } else {
                         false
                     };
                     let wrote_may_trip = if let Some(data) = may_trip_data {
-                        Self::write_curve(device, TripCurve::MayTrip, data, n_pt, x_sf, y_sf)
-                            .await?
+                        Self::write_curve(
+                            device,
+                            &mut batch,
+                            TripCurve::MayTrip,
+                            data,
+                            n_pt,
+                            x_sf,
+                            y_sf,
+                        )
                     } else {
                         false
                     };
                     let wrote_mom_cess = if let Some(data) = mom_cess_data {
-                        Self::write_curve(device, TripCurve::MomCess, data, n_pt, x_sf, y_sf)
-                            .await?
+                        Self::write_curve(
+                            device,
+                            &mut batch,
+                            TripCurve::MomCess,
+                            data,
+                            n_pt,
+                            x_sf,
+                            y_sf,
+                        )
                     } else {
                         false
                     };
+                    batch.send(device).await?;
 
                     wrote_must_trip || wrote_may_trip || wrote_mom_cess
                 }
@@ -1539,18 +1541,22 @@ where
         curve_addr + Self::GCrv::LEN + Self::GPt::LEN * data_point_index
     }
 
-    /// Write the curve to its offset location, returning the curve address if
-    /// the curve was written and None otherwise.
+    /// Add the curve at its offset location to the batch, returning the curve
+    /// address if the curve was added and None otherwise. `header` is the
+    /// fixed part of the model as returned by `read_model_header`.
     ///
-    /// It is the caller's responsibility to set the ADPT_CRV_REQ to
-    /// TARGET_CURVE when the caller has finished populating the curve data.
-    /// This function cannot know all of the other group points.
-    async fn write_curve(
+    /// It is the caller's responsibility to send the batch and then set the
+    /// ADPT_CRV_REQ to TARGET_CURVE when the caller has finished populating
+    /// the curve data. This function cannot know all of the other group
+    /// points.
+    fn write_curve(
         device: &AsyncDevice<TokioModbusContext>,
+        header: &[u16],
+        batch: &mut WriteBatch,
         curve_data: &Curve<TX, TY>,
     ) -> Result<Option<u16>> {
-        let n_curves = device.read_point(Self::N_CRV).await.map_err(comm_err)?;
-        let n_pt = device.read_point(Self::N_PT).await.map_err(comm_err)?;
+        let n_curves = Self::N_CRV.from_data(header).map_err(comm_err)?;
+        let n_pt = Self::N_PT.from_data(header).map_err(comm_err)?;
 
         if n_curves < Self::TARGET_CURVE {
             log::warn!(
@@ -1570,31 +1576,26 @@ where
             return Ok(None);
         }
 
-        let x_sf = device.read_point(Self::X_SF).await.map_err(comm_err)?;
-        let y_sf = device.read_point(Self::Y_SF).await.map_err(comm_err)?;
+        let x_sf = Self::X_SF.from_data(header).map_err(comm_err)?;
+        let y_sf = Self::Y_SF.from_data(header).map_err(comm_err)?;
 
         let curve_addr =
             Self::addr(&device.models).addr + Self::curve_offset(Self::TARGET_CURVE, n_pt);
 
-        // Write the number of active points first.
-        write_offset_point(device, curve_addr, Self::CRV_ACT_PT, curve_data.len()).await?;
+        batch.add(curve_addr, Self::CRV_ACT_PT, curve_data.len());
 
         for (i, point) in curve_data.iter_scaled().enumerate() {
             let data_point_offset = Self::data_point_offset(curve_addr, i as u16);
-            write_offset_point(
-                device,
+            batch.add(
                 data_point_offset,
                 Self::X_PT,
                 Some(point.0.rescale(x_sf).value),
-            )
-            .await?;
-            write_offset_point(
-                device,
+            );
+            batch.add(
                 data_point_offset,
                 Self::Y_PT,
                 Some(point.1.rescale(y_sf).value),
-            )
-            .await?;
+            );
         }
 
         Ok(Some(curve_addr))

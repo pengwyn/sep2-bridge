@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::future::ready;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sunspec::models::model1::Model1;
@@ -52,6 +53,7 @@ impl SunSpecMock {
         // Mutex these states for the service.
         let service_data = SunSpecService {
             registers: Arc::new(Mutex::new(registers)),
+            request_count: Arc::new(AtomicUsize::new(0)),
         };
 
         Ok(SunSpecMock {
@@ -152,6 +154,11 @@ impl SunSpecMock {
         offset
     }
 
+    /// The total number of modbus requests the server has received.
+    pub fn request_count(&self) -> usize {
+        self.service_data.request_count.load(Ordering::SeqCst)
+    }
+
     /// Sets a value of a named register. For new registers to be added, their
     /// names need to be specially included when initialising the registers.
     pub fn set_value<T: Value>(&self, name: &str, value: T) {
@@ -181,6 +188,7 @@ impl Drop for SunSpecMock {
 #[derive(Clone, Debug)]
 struct SunSpecService {
     registers: Arc<Mutex<Vec<u16>>>,
+    request_count: Arc<AtomicUsize>,
 }
 
 impl tokio_modbus::server::Service for SunSpecService {
@@ -190,6 +198,7 @@ impl tokio_modbus::server::Service for SunSpecService {
     type Future = std::future::Ready<Result<Self::Response, Self::Exception>>;
 
     fn call(&self, req: Self::Request) -> Self::Future {
+        self.request_count.fetch_add(1, Ordering::SeqCst);
         let mut regs = self.registers.lock().unwrap();
 
         match req {

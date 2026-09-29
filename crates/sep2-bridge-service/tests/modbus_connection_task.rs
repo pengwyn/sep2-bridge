@@ -5,9 +5,14 @@ use std::time::Duration;
 use modbus_server_mock::SunSpecMock;
 use sep2_bridge::{
     Result, ScaledValue,
-    modbus_connection::{self, Capabilities, Metering, Model711Ctl, Settings, Status, Transport},
+    modbus_connection::{
+        self, Capabilities, Curve, Metering, Model711Ctl, Settings, Status, Transport,
+    },
 };
-use sunspec::models::{model701, model703, model704, model711};
+use sunspec::{
+    Group,
+    models::{model701, model703, model704, model705, model707, model711},
+};
 use tokio::{
     sync::mpsc,
     task::{self, JoinHandle},
@@ -46,6 +51,83 @@ async fn sends_parameters_to_device() {
         mock.get_value::<model704::WRmpRef>("model704::W_RMP_REF"),
         model704::WRmpRef::WMax
     );
+
+    // Curves are written into the 2nd curve (set) of their models. Only count
+    // the requests from here, as the first command also connected the device.
+    let requests_before = mock.request_count();
+    input_ch
+        .send(modbus_connection::Command::UpdateParameters(
+            modbus_connection::Parameters {
+                // Rescaled to the mock's V_SF of 1 and DEPT_REF_SF of 2.
+                der_volt_var: Some(Curve {
+                    points: vec![(2300, 300), (2500, -300)],
+                    sf_x: -1,
+                    sf_y: 0,
+                }),
+                // Rescaled to the mock's V_SF of 1 and TMS_SF of 2.
+                der_trip_lv_must: Some(Curve {
+                    points: vec![(2000, 100), (1800, 200)],
+                    sf_x: -1,
+                    sf_y: 0,
+                }),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("Send error");
+
+    time::sleep(WAIT_TIME).await;
+
+    let crv_addr = mock.get_name_addr("model705::CRV_2_ACT_PT");
+    let pt_addr = crv_addr + usize::from(model705::Crv::LEN);
+    assert_eq!(mock.get_value::<u16>("model705::CRV_2_ACT_PT"), 2);
+    assert_eq!(mock.get_value_at_addr::<Option<u16>>(pt_addr, 1), Some(23));
+    assert_eq!(
+        mock.get_value_at_addr::<Option<i16>>(pt_addr + 1, 1),
+        Some(3)
+    );
+    assert_eq!(
+        mock.get_value_at_addr::<Option<u16>>(pt_addr + 2, 1),
+        Some(25)
+    );
+    assert_eq!(
+        mock.get_value_at_addr::<Option<i16>>(pt_addr + 3, 1),
+        Some(-3)
+    );
+    assert_eq!(mock.get_value::<u16>("model705::ADPT_CRV_REQ"), 2);
+    assert_eq!(
+        mock.get_value::<model705::Ena>("model705::ENA"),
+        model705::Ena::Enabled
+    );
+
+    let pt_addr = mock.get_name_addr("model707::CRV_2_MUST_TRIP") + 1;
+    assert_eq!(
+        mock.get_value::<Option<u16>>("model707::CRV_2_MUST_TRIP"),
+        Some(2)
+    );
+    assert_eq!(mock.get_value_at_addr::<Option<u16>>(pt_addr, 1), Some(20));
+    assert_eq!(
+        mock.get_value_at_addr::<Option<u32>>(pt_addr + 1, 2),
+        Some(1)
+    );
+    assert_eq!(
+        mock.get_value_at_addr::<Option<u16>>(pt_addr + 3, 1),
+        Some(18)
+    );
+    assert_eq!(
+        mock.get_value_at_addr::<Option<u32>>(pt_addr + 4, 2),
+        Some(2)
+    );
+    assert_eq!(mock.get_value::<u16>("model707::ADPT_CRV_REQ"), 2);
+    assert_eq!(
+        mock.get_value::<model707::Ena>("model707::ENA"),
+        model707::Ena::Enabled
+    );
+
+    // Guards against falling back to one request per point. Writing point by
+    // point took 29 requests; batching takes 15.
+    let requests = mock.request_count() - requests_before;
+    assert!(requests <= 20, "{requests} requests");
 }
 
 /// Tests that parameters are rescaled from whatever scale factor they arrive
