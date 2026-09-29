@@ -303,13 +303,19 @@ async fn main() -> Result<ExitCode> {
     )
     .expect("Could not create client");
 
-    let device_to_register = SEDevice::new_from_cert(&cert_path, DeviceCategoryType::all()).or(
-        // Fatal error - we can't continue.
-        Err(Error::InvalidInput(format!(
-            "Device could not be loaded from certificate at {}",
-            cert_path.display()
-        ))),
-    )?;
+    let device_to_register = {
+        let mut device = SEDevice::new_from_cert(&cert_path, DeviceCategoryType::all()).or(
+            // Fatal error - we can't continue.
+            Err(Error::InvalidInput(format!(
+                "Device could not be loaded from certificate at {}",
+                cert_path.display()
+            ))),
+        )?;
+        // sep2-client doesn't assign the category to the edev as well, so we
+        // need to manually add this.
+        device.edev.device_category = Some(DeviceCategoryType::all());
+        device
+    };
 
     let lfdi = device_to_register.lfdi;
     let sfdi = device_to_register.sfdi;
