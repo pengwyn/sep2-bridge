@@ -298,11 +298,11 @@ async fn sends_der_status() {
     // The mock seeds CONN_ST as None, so this cannot pass vacuously.
     assert_eq!(
         status.gen_connect_status.map(|status| status.value),
-        Some(ConnectStatusValue::Connected)
+        Some(ConnectStatusValue::Connected | ConnectStatusValue::Operating)
     );
     assert_eq!(
         status.stor_connect_status.map(|status| status.value),
-        Some(ConnectStatusValue::Connected)
+        Some(ConnectStatusValue::Connected | ConnectStatusValue::Operating)
     );
     assert_eq!(status.alarm_status, Some(EXPECTED_ALARM_STATUS));
     assert_eq!(

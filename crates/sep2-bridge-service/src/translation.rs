@@ -156,18 +156,28 @@ impl TryFrom<ModbusStatus> for DERStatus {
     type Error = NamedError;
 
     fn try_from(status: ModbusStatus) -> Result<DERStatus> {
-        let connect_status = status
-            .conn_st
-            .try_convert()
-            .map_err(|err| err.name("conn_st"))?;
+        // The connect status on the SEP2 side has multiple bits. We pull these
+        // from both the conn_st and st parameters, ignoring any invalid options.
+        let mut connect_status = ConnectStatusValue::empty();
+        if status.conn_st == Some(model701::ConnSt::Connected) {
+            connect_status |= ConnectStatusValue::Connected;
+        }
+        if status.st == Some(model701::St::On) {
+            connect_status |= ConnectStatusValue::Operating;
+        }
+
+        let connect_status = ConnectStatusType {
+            value: connect_status,
+            ..Default::default()
+        };
 
         Ok(DERStatus {
             operational_mode_status: status
                 .st
                 .try_convert()
                 .map_err(|err| err.name("operational_mode_status"))?,
-            gen_connect_status: connect_status.clone(),
-            stor_connect_status: connect_status,
+            gen_connect_status: Some(connect_status.clone()),
+            stor_connect_status: Some(connect_status),
             alarm_status: status.alrm.convert(),
             state_of_charge_status: status.soc.convert(),
             reading_time: Int64(Utc::now().timestamp()),
@@ -567,7 +577,16 @@ impl TryFrom<ControlAttributes> for ModbusParameters {
             droop_ctl: attrs.inner.der_control_base.op_mod_freq_droop.convert(),
 
             // AS5438 - Table F.10 to E.10
-            es: attrs.inner.der_control_base.op_mod_connect.convert(),
+            es: match (
+                attrs.inner.der_control_base.op_mod_connect,
+                attrs.inner.der_control_base.op_mod_energize,
+            ) {
+                (Some(x), Some(y)) => Some(x && y),
+                (Some(x), None) => Some(x),
+                (None, Some(y)) => Some(y),
+                (None, None) => None,
+            }
+            .convert(),
             esv_hi: attrs
                 .inner
                 .set_es_high_volt
