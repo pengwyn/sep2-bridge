@@ -8,7 +8,7 @@ use std::{net::SocketAddr, str::FromStr, time::Duration};
 
 use chrono::Utc;
 use sep2_bridge::{
-    Result, deactivated_broadcast, dispatch, modbus_connection, scheduler, sep2_connection,
+    Result, deactivated_broadcast, dispatch, modbus_connection, ramp, scheduler, sep2_connection,
 };
 use sep2_client::{client::Client, device::SEDevice};
 use sep2_common::{
@@ -103,6 +103,11 @@ pub async fn start_bridge(sunspec_addr: SocketAddr, sep2_mock: &MockServer) -> J
         None,
     ));
 
+    // Start the ramp task.
+    let (ramp_input_tx, ramp_input_rx) = mpsc::channel(10);
+    let (ramp_output_tx, ramp_output_rx) = deactivated_broadcast(10);
+    join_set.spawn(ramp::task(ramp_output_tx, ramp_input_rx));
+
     // Start the modbus task.
     let (modbus_input_tx, modbus_input_rx) = mpsc::channel(10);
     let (modbus_output_tx, modbus_output_rx) = deactivated_broadcast(10);
@@ -126,6 +131,12 @@ pub async fn start_bridge(sunspec_addr: SocketAddr, sep2_mock: &MockServer) -> J
     ));
     join_set.spawn(dispatch::control_change_dispatcher(
         scheduler_output_rx.activate_cloned(),
+        ramp_input_tx.clone(),
+    ));
+
+    // Dispatch ramp events to the modbus task.
+    join_set.spawn(dispatch::ramped_parameters_dispatcher(
+        ramp_output_rx.activate_cloned(),
         modbus_input_tx.clone(),
     ));
 

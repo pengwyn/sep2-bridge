@@ -23,7 +23,7 @@ use url::Url;
 use sep2_bridge::{
     Error, Result, deactivated_broadcast, dispatch, metrics,
     modbus_connection::{self, Transport as ModbusTransport},
-    scheduler, sep2_connection,
+    ramp, scheduler, sep2_connection,
 };
 
 /// A bridge service that translates IEEE 2030.5 (SEP2) messages to and from external
@@ -375,6 +375,12 @@ async fn main() -> Result<ExitCode> {
     ));
     task_names.insert(handle.id(), "scheduler");
 
+    // Start the ramp task.
+    let (ramp_input_tx, ramp_input_rx) = mpsc::channel(10);
+    let (ramp_output_tx, ramp_output_rx) = deactivated_broadcast(10);
+    let handle = join_set.spawn(ramp::task(ramp_output_tx, ramp_input_rx));
+    task_names.insert(handle.id(), "ramp");
+
     // Start the modbus task.
     let (modbus_input_tx, modbus_input_rx) = mpsc::channel(10);
     let (modbus_output_tx, modbus_output_rx) = deactivated_broadcast(10);
@@ -401,9 +407,16 @@ async fn main() -> Result<ExitCode> {
     task_names.insert(handle.id(), "sep2_subscription_and_notification_dispatcher");
     let handle = join_set.spawn(dispatch::control_change_dispatcher(
         scheduler_output_rx.activate_cloned(),
-        modbus_input_tx.clone(),
+        ramp_input_tx.clone(),
     ));
     task_names.insert(handle.id(), "control_change_dispatcher");
+
+    // Dispatch ramp events to the right places.
+    let handle = join_set.spawn(dispatch::ramped_parameters_dispatcher(
+        ramp_output_rx.activate_cloned(),
+        modbus_input_tx.clone(),
+    ));
+    task_names.insert(handle.id(), "ramped_parameters_dispatcher");
 
     // Dispatch modbus_conn events to the right places.
     let handle = join_set.spawn(dispatch::sep2_device_state_dispatcher(

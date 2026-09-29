@@ -29,4 +29,5 @@ url.workspace = true
 proptest.workspace = true
 wiremock.workspace = true
 regex.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-modbus = { workspace = true, features = ["tcp-server"] }

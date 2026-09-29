@@ -7,7 +7,7 @@ use sep2_bridge::{
     Result, ScaledValue,
     modbus_connection::{self, Capabilities, Metering, Model711Ctl, Settings, Status, Transport},
 };
-use sunspec::models::{model701, model703, model711};
+use sunspec::models::{model701, model703, model704, model711};
 use tokio::{
     sync::mpsc,
     task::{self, JoinHandle},
@@ -27,6 +27,8 @@ async fn sends_parameters_to_device() {
         .send(modbus_connection::Command::UpdateParameters(
             modbus_connection::Parameters {
                 es: Some(model703::Es::Enabled),
+                w_rmp: Some(3),
+                w_rmp_ref: Some(model704::WRmpRef::WMax),
                 ..Default::default()
             },
         ))
@@ -39,6 +41,11 @@ async fn sends_parameters_to_device() {
     // Ensure the device mock has received the parameters.
     let value = mock.get_value::<model703::Es>("model703::ES");
     assert_eq!(value, model703::Es::Enabled);
+    assert_eq!(mock.get_value::<u16>("model704::W_RMP"), 3);
+    assert_eq!(
+        mock.get_value::<model704::WRmpRef>("model704::W_RMP_REF"),
+        model704::WRmpRef::WMax
+    );
 }
 
 /// Tests that parameters are rescaled from whatever scale factor they arrive

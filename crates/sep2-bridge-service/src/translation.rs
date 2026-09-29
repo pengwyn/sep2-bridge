@@ -214,6 +214,13 @@ impl TryFrom<ModbusSettings> for DERSettings {
             set_es_delay: settings.es_dly_tms.map(seconds_to_hundredths).convert(),
             set_es_random_delay: settings.es_rnd_tms.map(seconds_to_hundredths).convert(),
             set_es_ramp_tms: settings.es_rmp_tms.map(seconds_to_hundredths).convert(),
+            // See docs/bridging_decisions.md for these two ramp rates.
+            set_grad_w: Uint16(settings.w_rmp.map_or(0, |w_rmp| w_rmp.saturating_mul(100))),
+            set_soft_grad_w: settings
+                .es_rmp_tms
+                .map(invert_full_ramp)
+                .try_convert()
+                .map_err(|err| err.name("set_soft_grad_w"))?,
             // TODO: This is just for testing with cactus
             doe_modes_enabled: Some(DOEControlType::empty()),
             updated_time: Int64(Utc::now().timestamp()),
@@ -619,11 +626,17 @@ impl TryFrom<ControlAttributes> for ModbusParameters {
                 .set_es_random_delay
                 .convert()
                 .map(hundredths_to_seconds),
+            // When no enter service ramp time is given, fall back to the soft
+            // ramp rate. See docs/bridging_decisions.md.
             es_rmp_tms: attrs
                 .inner
                 .set_es_ramp_tms
                 .convert()
-                .map(hundredths_to_seconds),
+                .map(hundredths_to_seconds)
+                .or(attrs
+                    .inner
+                    .set_soft_grad_w
+                    .map(|soft_grad| invert_full_ramp(u32::from(soft_grad.0)))),
 
             // AS5438 - Table F.11 to E.11
             w_max_lim_pct_ena: attrs
@@ -667,6 +680,11 @@ impl TryFrom<ControlAttributes> for ModbusParameters {
                 (None, Some(_)) => Some(model704::WSetMod::Watts),
                 (Some(_), Some(_)) => Some(model704::WSetMod::WMaxPct),
             },
+
+            // Extension - the default ramp rate. WRmp is in whole percent per
+            // second, so round up to avoid a small rate becoming 0 (no limit).
+            w_rmp: attrs.inner.set_grad_w.map(|grad| grad.0.div_ceil(100)),
+            w_rmp_ref: attrs.inner.set_grad_w.map(|_| model704::WRmpRef::WMax),
         })
     }
 }
@@ -680,6 +698,12 @@ fn seconds_to_hundredths(seconds: u32) -> u32 {
     ScaledValue::new(seconds, SUNSPEC_SECONDS_SF)
         .rescale(SEP2_HUNDREDTHS_SF)
         .value
+}
+/// Converts between a ramp over the full range (100%) in seconds, and a ramp
+/// rate in hundredths of a percent per second. The conversion is its own
+/// inverse. A value of 0 (no ramp) stays 0.
+fn invert_full_ramp(value: u32) -> u32 {
+    10_000u32.checked_div(value).unwrap_or(0)
 }
 
 //////
@@ -1380,11 +1404,13 @@ mod tests {
             es_hz_lo: Some(ScaledValue::new(45, SEP2_THOUSANDTHS_SF)),
             es_dly_tms: Some(46),
             es_rnd_tms: Some(47),
-            es_rmp_tms: Some(48),
+            es_rmp_tms: Some(50),
+            w_rmp: Some(2),
         };
 
-        let result: Result<DERSettings> = settings.try_into();
-        assert!(result.is_ok());
+        let result: DERSettings = settings.try_into().expect("Translation failed");
+        assert_eq!(result.set_grad_w, Uint16(200));
+        assert_eq!(result.set_soft_grad_w, Some(Uint16(200)));
     }
 
     /// Test translation of scale factor to SEP2.
@@ -1529,6 +1555,9 @@ mod tests {
                 // 51.00 Hz and 49.00 Hz.
                 set_es_high_freq: Some(Uint16(5100)),
                 set_es_low_freq: Some(Uint16(4900)),
+                // 0.27 %/s and 0.50 %/s.
+                set_grad_w: Some(Uint16(27)),
+                set_soft_grad_w: Some(Uint16(50)),
                 ..Default::default()
             },
             ..Default::default()
@@ -1542,6 +1571,11 @@ mod tests {
         assert_eq!(result.es_hz_lo, Some(ScaledValue::new(4900, -2)));
         assert_eq!(result.w_max_lim_pct, Some(ScaledValue::new(8000, -2)));
         assert_eq!(result.w_set_pct, Some(ScaledValue::new(-2500, -2)));
+        // Rounded up to whole percent per second.
+        assert_eq!(result.w_rmp, Some(1));
+        assert_eq!(result.w_rmp_ref, Some(model704::WRmpRef::WMax));
+        // No set_es_ramp_tms, so 100% at 0.50 %/s is 200 seconds.
+        assert_eq!(result.es_rmp_tms, Some(200));
     }
 
     /// Times are the one group with no scale factor on the sunspec side, so

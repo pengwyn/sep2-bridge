@@ -3,6 +3,7 @@ use derive_more::Display;
 pub mod dispatch;
 pub mod metrics;
 pub mod modbus_connection;
+pub mod ramp;
 mod scaled_value;
 pub mod scheduler;
 pub mod sep2_connection;

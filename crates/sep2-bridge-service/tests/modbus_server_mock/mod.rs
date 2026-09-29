@@ -697,6 +697,13 @@ pub fn add_model_704(
         "model704::W_SET_SF".into(),
         location(Model704::W_SET_SF, offset),
     );
+    Model704::W_RMP.fill_registers(registers, offset, None);
+    locations.insert("model704::W_RMP".into(), location(Model704::W_RMP, offset));
+    Model704::W_RMP_REF.fill_registers(registers, offset, None);
+    locations.insert(
+        "model704::W_RMP_REF".into(),
+        location(Model704::W_RMP_REF, offset),
+    );
 
     offset + usize::from(length)
 }

@@ -119,6 +119,10 @@ pub struct Parameters {
     pub w_set_ena: Option<model704::WSetEna>,
     pub w_set_mod: Option<model704::WSetMod>,
     pub w_set: Option<ScaledValue<i32>>,
+
+    // Extension - the default ramp rate (setGradW) is applied by the device.
+    pub w_rmp: Option<u16>,
+    pub w_rmp_ref: Option<model704::WRmpRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,7 +242,24 @@ pub async fn task(
             && parameters != last_sent_parameters
             && let Some(parameters) = &parameters
         {
-            match time::timeout(COMM_TIMEOUT, send_new_parameters(device, parameters)).await {
+            // During a ramp only the active power values change, so avoid
+            // rewriting every other model (particularly the curves) each step.
+            let only_active_power_changed = last_sent_parameters.as_ref().is_some_and(|last| {
+                Parameters {
+                    w_max_lim_pct: last.w_max_lim_pct,
+                    w_set_pct: last.w_set_pct,
+                    w_set: last.w_set,
+                    ..parameters.clone()
+                } == *last
+            });
+            let send = async {
+                if only_active_power_changed {
+                    send_model704_parameters(device, parameters).await
+                } else {
+                    send_new_parameters(device, parameters).await
+                }
+            };
+            match time::timeout(COMM_TIMEOUT, send).await {
                 Err(_) => {
                     drop_connection(device_opt.take(), Error::CommunicationTimeout).await;
                 }
@@ -498,10 +519,11 @@ pub struct Settings {
     pub es_dly_tms: Option<u32>,
     pub es_rnd_tms: Option<u32>,
     pub es_rmp_tms: Option<u32>,
+    pub w_rmp: Option<u16>,
 }
 
 impl Settings {
-    fn from(m703: &Option<Model703>) -> Option<Self> {
+    fn from(m703: &Option<Model703>, w_rmp: Option<u16>) -> Option<Self> {
         m703.as_ref().map(|m703| {
             let v_sf = m703.v_sf.unwrap_or_default();
             let hz_sf = m703.hz_sf.unwrap_or_default();
@@ -517,6 +539,7 @@ impl Settings {
                 es_dly_tms: m703.es_dly_tms,
                 es_rnd_tms: m703.es_rnd_tms,
                 es_rmp_tms: m703.es_rmp_tms,
+                w_rmp,
             }
         })
     }
@@ -608,10 +631,16 @@ async fn poll_device_state(
     let m701 = read_model_safe::<Model701>(device).await?;
     let m703 = read_model_safe::<Model703>(device).await?;
     let m713 = read_model_safe::<Model713>(device).await?;
+    // Only the ramp rate is needed from model 704, so avoid reading the whole model.
+    let w_rmp = if device.models.supported_model_ids().contains(&704) {
+        device.read_point(Model704::W_RMP).await.map_err(comm_err)?
+    } else {
+        None
+    };
 
     Ok((
         Status::from(&m701, &m713),
-        Settings::from(&m703),
+        Settings::from(&m703, w_rmp),
         Metering::from(&m701),
     ))
 }
@@ -842,6 +871,10 @@ async fn send_model704_parameters(
         write_rescaled_if_some(device, Model704::W_SET, parameters.w_set, w_set_sf).await?;
     }
     write_if_some(device, Model704::W_SET_MOD, parameters.w_set_mod).await?;
+
+    // Extension: the default ramp rate.
+    write_if_some(device, Model704::W_RMP, parameters.w_rmp).await?;
+    write_if_some(device, Model704::W_RMP_REF, parameters.w_rmp_ref).await?;
 
     Ok(())
 }

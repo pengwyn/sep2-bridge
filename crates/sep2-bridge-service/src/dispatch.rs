@@ -1,10 +1,11 @@
 use async_broadcast::Receiver as BroadcastReceiver;
 use chrono::Utc;
 use sep2_common::packages::primitives::Int64;
+use std::time::Duration;
 use tokio::sync::mpsc::Sender as MpscSender;
 
 use crate::{
-    Error, Result, modbus_connection, scheduler,
+    Error, Result, modbus_connection, ramp, scheduler,
     sep2_connection::{self, ControlResponse, Sep2ResourceEvent},
 };
 
@@ -80,20 +81,27 @@ pub async fn sep2_subscription_and_notification_dispatcher(
 }
 
 /// Reacts to changes in the currently applied controls from the scheduler and
-/// sends these as commands to the modbus task.
+/// sends these as commands to the ramp task.
 pub async fn control_change_dispatcher(
     mut scheduler_output: BroadcastReceiver<scheduler::Event>,
-    modbus_input: MpscSender<modbus_connection::Command>,
+    ramp_input: MpscSender<ramp::Command>,
 ) -> Result<()> {
     while let Ok(event) = scheduler_output.recv().await {
         match event {
             scheduler::Event::ParametersChanged(control_attributes) => {
+                // rampTms is in hundredths of a second.
+                let ramp_time = control_attributes
+                    .inner
+                    .der_control_base
+                    .ramp_tms
+                    .map(|ramp_tms| Duration::from_millis(u64::from(ramp_tms.0) * 10));
                 match (*control_attributes).clone().try_into() {
                     Ok(modbus_parameters) => {
-                        modbus_input
-                            .send(modbus_connection::Command::UpdateParameters(
-                                modbus_parameters,
-                            ))
+                        ramp_input
+                            .send(ramp::Command::UpdateTarget {
+                                parameters: modbus_parameters,
+                                ramp_time,
+                            })
                             .await
                             .map_err(|_| Error::ChannelClosed)?;
                     }
@@ -111,6 +119,21 @@ pub async fn control_change_dispatcher(
         }
     }
 
+    Err(Error::ChannelClosed)
+}
+
+/// Reacts to the parameters produced by the ramp task and sends these as
+/// commands to the modbus task.
+pub async fn ramped_parameters_dispatcher(
+    mut ramp_output: BroadcastReceiver<ramp::Event>,
+    modbus_input: MpscSender<modbus_connection::Command>,
+) -> Result<()> {
+    while let Ok(ramp::Event::ParametersChanged(parameters)) = ramp_output.recv().await {
+        modbus_input
+            .send(modbus_connection::Command::UpdateParameters(parameters))
+            .await
+            .map_err(|_| Error::ChannelClosed)?;
+    }
     Err(Error::ChannelClosed)
 }
 
