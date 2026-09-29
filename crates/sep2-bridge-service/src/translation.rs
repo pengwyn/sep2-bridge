@@ -1,21 +1,22 @@
 // Translation between SEP2 and Modbus
 
-use chrono::Utc;
+use chrono::{DurationRound, TimeDelta, Utc};
 use derive_more::Display;
 use sep2_common::packages::{
     der::{
         ActivePower, ApparentPower, ConnectStatusType, ConnectStatusValue, DERAlarmStatus,
         DERCapability, DERControlType, DERCurve, DERSettings, DERStatus, DERUnitRefType,
-        FreqDroopType, OperationalModeStatusType, OperationalModeStatusValue, PowerFactor,
-        ReactivePower, ReactiveSusceptance, StateOfChargeStatusType, VoltageRMS,
+        DOEControlType, FreqDroopType, OperationalModeStatusType, OperationalModeStatusValue,
+        PowerFactor, ReactivePower, ReactiveSusceptance, StateOfChargeStatusType, VoltageRMS,
     },
     links::DERCurveLink,
     metering::{Reading, ReadingType},
     metering_mirror::MirrorMeterReading,
     primitives::{Int16, Int32, Int48, Int64, String32, Uint16, Uint32},
     types::{
-        AccumulationBehaviourType, CommodityType, DateTimeInterval, FlowDirectionType, KindType,
-        Percent, PhaseCode, PowerOfTenMultiplierType, SignedPercent, UomType,
+        AccumulationBehaviourType, CommodityType, DataQualifierType, DateTimeInterval,
+        FlowDirectionType, KindType, Percent, PhaseCode, PowerOfTenMultiplierType, SignedPercent,
+        UomType,
     },
 };
 use std::convert::TryFrom;
@@ -144,6 +145,8 @@ impl TryFrom<ModbusCapabilities> for DERCapability {
                 .react_suscept_rtg
                 .try_convert()
                 .map_err(|err| err.name("rtg_reactive_susceptance"))?,
+            // TODO: This is just for testing with cactus.
+            doe_modes_supported: DOEControlType::empty(),
             ..Default::default()
         })
     }
@@ -201,6 +204,8 @@ impl TryFrom<ModbusSettings> for DERSettings {
             set_es_delay: settings.es_dly_tms.map(seconds_to_hundredths).convert(),
             set_es_random_delay: settings.es_rnd_tms.map(seconds_to_hundredths).convert(),
             set_es_ramp_tms: settings.es_rmp_tms.map(seconds_to_hundredths).convert(),
+            // TODO: This is just for testing with cactus
+            doe_modes_enabled: Some(DOEControlType::empty()),
             updated_time: Int64(Utc::now().timestamp()),
             ..Default::default()
         })
@@ -211,18 +216,29 @@ impl TryFrom<ModbusMetering> for Vec<MirrorMeterReading> {
     type Error = NamedError;
 
     fn try_from(metering: ModbusMetering) -> Result<Vec<MirrorMeterReading>> {
-        let now = Int64(Utc::now().timestamp());
+        // TODO: Figure out exactly what CSIP-AUS wants. Cactus seems to complain if not on the exactly minute.
+        let measurement_time = Int64(
+            Utc::now()
+                .duration_trunc(TimeDelta::minutes(1))
+                .map_err(|err| {
+                    log::error!("Unexpected error when rounding to nearest minute: {err}");
+                    Error::UnmappableInvalid.name("time")
+                })?
+                .timestamp(),
+        );
+        let averaging_duration = Uint32(60);
 
         let template_reading_type = ReadingType {
             kind: Some(KindType::Power),
             accumulation_behaviour: Some(AccumulationBehaviourType::Instantaneous),
             commodity: Some(CommodityType::ElectricitySecondaryMetered),
+            data_qualifier: Some(DataQualifierType::Average),
             ..Default::default()
         };
         let template_reading = Reading {
             time_period: Some(DateTimeInterval {
-                start: now,
-                duration: Uint32(0),
+                start: measurement_time,
+                duration: averaging_duration,
             }),
             ..Default::default()
         };
